@@ -1,6 +1,9 @@
 @echo off
 rem Optional: build make-space.exe next to this script (PyInstaller, onefile).
 rem Needs Python 3.8+ and network on first run (downloads PyInstaller into _build\pylibs).
+rem The machine that RUNS make-space.exe does not need Python; the machine that BUILDS it does.
+rem After building, "one-click generate" prefers the exe over make_space.py: re-run this script
+rem (or delete make-space.exe) whenever make_space.py changes, else you run stale logic.
 setlocal
 cd /d "%~dp0"
 
@@ -26,7 +29,7 @@ if errorlevel 1 goto fail
 
 echo.
 echo Done: %~dp0make-space.exe
-echo Double-click it to generate .\workspace next to itself.
+echo Run it through the sibling .bat (direct double-click may fail on locked TEMP).
 pause
 exit /b 0
 

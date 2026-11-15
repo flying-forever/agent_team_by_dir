@@ -25,12 +25,13 @@
 import argparse
 import datetime
 import os
+import shutil
 import sys
 from pathlib import Path
 
-VERSION = "1.0"
+VERSION = "1.1"
 
-# 目录位置即状态，顺序与协议第 2 节一致
+# 目录位置即状态，顺序与协议第 2 节一致；roster/ 不是任务状态，是参与者名册
 STATE_DIRS = [
     "inbox",
     "running",
@@ -40,13 +41,42 @@ STATE_DIRS = [
     "heartbeats",
     "artifacts",
     "evidence",
+    "roster",
     "templates",
+]
+
+# 生成器写下的骨架文件（重置时按这份清单删，不去猜用户放了什么）
+SKELETON_FILES = [
+    "AGENTS.md",
+    "protocol.md",
+    "templates/task.json",
+    "templates/result.json",
+    "templates/agent-card.json",
 ]
 
 AGENTS_MD = """# 协作空间 · 入口说明
 
 > **进入本目录的 agent 先读完本文件，再读 `protocol.md`。**
 > 本文件与其余骨架由 `make_space.py` 生成；重新生成不会覆盖已有任务文件。
+
+## 0. 启动第一步：注册与发现
+
+**每个进入本区的 agent，开工前先做这一步**，否则别人看不到你、你也看不到别人：
+
+1. 把自己的名册条目写到 `roster/<你的id>.json`（先写 `roster/.<你的id>.json.tmp`，关闭后重命名为 `roster/<你的id>.json`）。字段见 `templates/agent-card.json`。
+2. 列出 `roster/` 目录，逐个读 JSON —— 这就是"谁在这个区里"。
+3. 只有 `state == "alive"` 且 `updated_at` 距今不超过 `ttl_seconds * 3` 的条目算在线，其余当离线，不据此派活。**这是名册自己的 TTL（默认 600×3=30 分钟），与第 4 节每任务心跳的 30 秒/3 分钟是两回事**，不要混用。
+4. 干活期间每 60 秒更新自己条目里的 `updated_at`；任务结束、放弃或准备退出时把 `state` 改成 `"left"`，**不要删除文件**。
+
+名册是**自己写自己**：只覆盖 `<你的id>.json`，不碰别人的条目。
+名册只解决"谁在"，**不解决"被叫醒"**——新任务仍靠人 / 父 agent 提示你去看 `inbox/`。
+
+### 0.1 人只需要交代两件事
+
+- **协作区根目录**（就是本文件所在目录）；
+- **你的 id**（若这个 id 不在第 2 节角色表里，再补一句你是协调者还是执行者）。
+
+其余——角色、目录、状态流转、注册方式、禁止项——都在本文件和 `protocol.md` 里，不必在开场白里重复。新会话重新开始同样只给这两项。
 
 ## 1. 这是什么
 
@@ -78,14 +108,15 @@ AGENTS_MD = """# 协作空间 · 入口说明
 | `heartbeats/<task_id>.json` | 每任务一个心跳 | 执行者 |
 | `artifacts/<task_id>/attempt-<n>/` | 本次执行产物 | 执行者 |
 | `evidence/` | 验收记录 | 协调者 |
+| `roster/<agent_id>.json` | 参与者名册，每个 agent 自己一条 | 各自写自己 |
 | `templates/` | 任务与结果模板 | 只读 |
 
 ## 4. 状态流转（最小闭环）
 
-1. 协调者写 `inbox/.<id>.tmp`，关闭后在同卷内重命名为 `inbox/<id>.json`。
-2. 执行者只处理 `assigned_to == <<WORKER>>` 的任务，先校验 `protocol_version`、路径、`allowed_write_paths`、`base_commit`。
-3. 用同卷原子重命名把 `inbox/<id>.json` 移到 `running/<id>.json`，**成功才算领取**；目标已存在就停止，禁止覆盖。
-4. 执行者记录 `worker_id`、`attempt`、领取时间（可写 `running/<id>.claim.json`），并每 30 秒更新 `heartbeats/<id>.json`。
+1. 协调者写 `inbox/.<task_id>.tmp`，关闭后在同卷内重命名为 `inbox/<task_id>.json`。
+2. 执行者只处理 `assigned_to == <<WORKER>>` 的任务，先校验 `protocol_version`、路径、`allowed_write_paths`、`base_commit`。`running/<task_id>.claim.json` 与 `heartbeats/<task_id>.json` 是协议固定位置，不受任务书 `allowed_write_paths` 限制。
+3. 用同卷原子重命名把 `inbox/<task_id>.json` 移到 `running/<task_id>.json`，**成功才算领取**；目标已存在就停止，禁止覆盖。
+4. 执行者记录 `worker_id`、`attempt`、领取时间（可写 `running/<task_id>.claim.json`），并每 30 秒更新 `heartbeats/<task_id>.json`。
 5. 先写报告和 `artifacts/<task_id>/attempt-<n>/result.json`（临时文件 + 重命名），再把任务移到 `done/`。
 6. 协调者核对 `task_id`、`attempt`、报告与证据：通过 -> 移到 `accepted/`，并在 `evidence/` 留验收记录；需修复 -> 新建后续任务并引用原 `id`。
 
@@ -107,8 +138,9 @@ AGENTS_MD = """# 协作空间 · 入口说明
 
 ## 7. 快速开始
 
-1. 协调者：复制 `templates/task.json`，填好后放到 `inbox/<id>.json`。
-2. 执行者：读 `inbox/`，确认 `assigned_to` 是自己，移到 `running/`，产物写 `artifacts/<id>/attempt-1/`。
+0. 每个 agent：按第 0 节写 `roster/<你的id>.json`，再读一遍 `roster/` 确认对方在线。
+1. 协调者：复制 `templates/task.json`，填好后放到 `inbox/<task_id>.json`。
+2. 执行者：读 `inbox/`，确认 `assigned_to` 是自己，移到 `running/`，产物写 `artifacts/<task_id>/attempt-1/`。
 3. 执行者：写报告 + `result.json`，把任务移到 `done/`。
 4. 协调者：验收，移到 `accepted/`（或 `failed/`），在 `evidence/` 留记录。
 """
@@ -130,6 +162,7 @@ PROTOCOL_MD = """# 本区实例参数
 | 执行者 id | `<<WORKER>>` |
 | 任务文件 | 每个任务一个 JSON，目录位置即状态 |
 | 产物根 | `artifacts/<task_id>/attempt-<n>/` |
+| 参与者名册 | `roster/<agent_id>.json` |
 
 ## 路径规则
 
@@ -150,7 +183,11 @@ PROTOCOL_MD = """# 本区实例参数
 1. 领取记录文件名：`running/<task_id>.claim.json`。
 2. 心跳文件名：`heartbeats/<task_id>.json`，内容至少包含 `task_id`、`attempt`、`worker_id`、`updated_at`、`pid`。
 3. 验收记录：`evidence/<task_id>-review.json`，含 `task_id`、`attempt`、`decision`、`checks`、`updated_at`。
-4. 任务 JSON 的 `base_commit` 非 Git 项目可填 `null`，但必须在 `context_files` 或 `instructions` 里写明输入基线（如文件哈希清单）。
+4. 任务 JSON 的 `base_commit` 非 Git 项目可填 `null`；有输入依赖时须在 `context_files` 或 `instructions` 写明输入基线（如文件哈希清单），纯生成型小任务可只填 `null` 且 `context_files: []`。
+5. 参与者名册：`roster/<agent_id>.json`，每个 agent 只写自己的条目，格式见 `templates/agent-card.json`；必填 `agent_id`、`role`（`coordinator` / `executor`）、`state`、`ttl_seconds`、`updated_at`。其中的 `workspace` 指**你实际干活的工作目录**，不确定就填 `null`，不要照抄本文件的默认值。
+6. 在线判定：`state == "alive"` 且 `now - updated_at <= ttl_seconds * 3`；退出时写 `state: "left"`，不删条目。解析失败或字段缺失的条目当无效，不作为派活依据。
+7. 派活前重读名册：协调者发布任务前读一次 `roster/`，`assigned_to` 只填在线的 id；执行者领取前也读一次，发现 `assigned_to` 不是自己就原地不动。
+8. 固定写入位置：`running/<task_id>.claim.json`、`heartbeats/<task_id>.json`、`roster/<agent_id>.json` 由协议规定，不受任务书 `allowed_write_paths` 约束；`allowed_write_paths` 只约束任务产物。
 
 ## 未采纳的扩展
 
@@ -194,6 +231,19 @@ RESULT_TEMPLATE = """{
 }
 """
 
+AGENT_CARD_TEMPLATE = """{
+  "agent_id": "<你的 id，必须与任务书的 created_by / assigned_to 一致>",
+  "role": "<coordinator | executor>",
+  "state": "<alive | left>",
+  "protocol_version": 1,
+  "workspace": "<你实际干活的工作目录；不确定填 null>",
+  "session_note": "<可选：窗口标题、启动方式等人类可读说明>",
+  "capabilities": ["read_files", "write_files"],
+  "ttl_seconds": 600,
+  "joined_at": "<ISO8601，第一次注册时间>",
+  "updated_at": "<ISO8601，每次心跳刷新>"
+}
+"""
 
 def say(msg=""):
     """打印，遇到控制台编码不支持时降级，不让脚本因输出崩溃。"""
@@ -240,6 +290,90 @@ def write_file(path, text, force, dry_run, stats):
     stats["planned"].append((verb, path))
 
 
+def looks_like_space(target):
+    """判断目标是不是本生成器产出的协作区，避免把不相干目录清掉。"""
+    if not target.is_dir():
+        return False
+    if any((target / m).is_file() for m in ("AGENTS.md", "protocol.md")):
+        return True
+    return any((target / d).is_dir() for d in STATE_DIRS)
+
+
+def reset_space(target, purge=False, assume_yes=False, dry_run=False, force=False, quiet=False):
+    """把协作区还原成生成前的样子。
+
+    默认（保守）：只删生成器写下的骨架文件和因此变空的目录；任务、产物、名册条目一律保留。
+    purge=True：连整个目录一起删，必须同时给 --yes。
+    """
+    if not target.exists():
+        say("[跳过] 目录不存在：%s" % target.as_posix())
+        return 0
+    if not target.is_dir():
+        say("[错误] 不是目录：%s" % target.as_posix())
+        return 2
+    if target == Path(target.anchor):
+        say("[错误] 目标是盘符根目录，不处理：%s" % target.as_posix())
+        return 2
+    if not looks_like_space(target) and not force:
+        say("[错误] 这里不像协作区（没有 AGENTS.md / protocol.md / 状态目录）：%s" % target.as_posix())
+        say("      确认要删就加 --force。")
+        return 2
+    if purge and not assume_yes:
+        say("[错误] --purge 会删除整个目录（含任务、产物、名册），需要同时加 --yes 确认。")
+        return 2
+
+    if purge:
+        say("重置（彻底清空）：%s%s" % (target.as_posix(), "  [dry-run]" if dry_run else ""))
+        if dry_run:
+            say("  将删除整个目录")
+            return 0
+        shutil.rmtree(str(target))
+        say("  已删除目录及全部内容。")
+        return 0
+
+    say("重置（保留任务数据）：%s%s" % (target.as_posix(), "  [dry-run]" if dry_run else ""))
+    removed, kept = [], []
+
+    planned = [p for p in (target / r for r in SKELETON_FILES) if p.is_file()]
+    planned += [p for p in (target / n / ".gitkeep" for n in STATE_DIRS) if p.is_file()]
+    planned_set = set(planned)
+    removed = [p.relative_to(target).as_posix() for p in planned]
+    if not dry_run:
+        for p in planned:
+            p.unlink()
+
+    empty_dirs = []
+    for name in STATE_DIRS:
+        d = target / name
+        if not d.is_dir():
+            continue
+        if [e for e in d.iterdir() if e not in planned_set]:
+            kept.append("%s/（非空，保留）" % name)
+            continue
+        empty_dirs.append(d)
+        removed.append(name + "/")
+    if not dry_run:
+        for d in empty_dirs:
+            d.rmdir()
+
+    if dry_run:
+        remain = [e for e in target.iterdir() if e not in planned_set and e not in empty_dirs]
+    else:
+        remain = list(target.iterdir())
+    if not remain:
+        removed.append("（目录本身）")
+        if not dry_run:
+            target.rmdir()
+
+    for item in removed:
+        if not quiet:
+            say("  删除 %s" % item)
+    for item in kept:
+        say("  保留 %s" % item)
+    say("完成：删除 %d 项，保留 %d 项。" % (len(removed), len(kept)))
+    return 0
+
+
 def base_dir():
     """脚本自身所在目录；打包成 exe 后取 exe 所在目录（onefile 的 __file__ 在临时解包目录里）。"""
     if getattr(sys, "frozen", False):
@@ -275,6 +409,12 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true",
                     help="只打印计划，不写盘")
     ap.add_argument("--quiet", action="store_true", help="少打印")
+    ap.add_argument("--reset", action="store_true",
+                    help="把协作区还原成生成前的状态：只删骨架与变空的目录，任务/产物/名册保留")
+    ap.add_argument("--purge", action="store_true",
+                    help="配合 --reset：连整个目录一起删，需同时加 --yes")
+    ap.add_argument("--yes", action="store_true",
+                    help="确认危险操作（--reset --purge）")
     args = ap.parse_args(argv)
 
     target = Path(args.target).expanduser() if args.target else here / "workspace"
@@ -288,6 +428,10 @@ def main(argv=None):
     if target == Path(target.anchor) or (target.exists() and not target.is_dir()):
         say("[错误] 目标路径不可用: %s" % target)
         return 2
+
+    if args.reset:
+        return reset_space(target, purge=args.purge, assume_yes=args.yes,
+                           dry_run=args.dry_run, force=args.force, quiet=args.quiet)
 
     now = datetime.datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
     now = now[:-2] + ":" + now[-2:] if len(now) > 5 else now
@@ -332,6 +476,7 @@ def main(argv=None):
             ("protocol.md", render(PROTOCOL_MD, values)),
             ("templates/task.json", render(TASK_TEMPLATE, values)),
             ("templates/result.json", render(RESULT_TEMPLATE, values)),
+            ("templates/agent-card.json", render(AGENT_CARD_TEMPLATE, values)),
         ]
         for relname, text in docs:
             write_file(target / relname, text, args.force, args.dry_run, stats)

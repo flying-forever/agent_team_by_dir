@@ -10,6 +10,7 @@ if exist "%~dp0make-space.exe" (
   if not exist "%~dp0.tmp" mkdir "%~dp0.tmp"
   set "TEMP=%~dp0.tmp"
   set "TMP=%~dp0.tmp"
+  if "%~1"=="" echo [i] using make-space.exe - rebuild after editing make_space.py, or delete it.
   "%~dp0make-space.exe" %*
   set "RC=%ERRORLEVEL%"
   rd /s /q "%~dp0.tmp" 2>nul
