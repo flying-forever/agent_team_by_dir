@@ -1,0 +1,13 @@
+# 生成物：跑一次 一键生成协作空间.bat 就能重建
+/workspace/
+
+# 打包中间产物
+/_build/
+/make-space.exe
+
+# 运行时临时目录（单文件 exe 解压用）
+/.tmp/
+
+# Python 缓存
+__pycache__/
+*.pyc
